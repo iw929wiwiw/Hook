@@ -1,5 +1,7 @@
--- Ken Hub Pet Finder + Hardened Anti-HTTP-Spy (Report & Kick)
+-- Ken Hub Pet Finder + Upgraded Hardened Anti-HTTP-Spy (Patched)
 -- Anti-spy runs FIRST (captures original HTTP functions before any hooks)
+-- Upgrades: reduced false-positives, optional setting to enable/disable anti-spy from GUI,
+-- trigger rules: immediate on reference replacement, or suspicious tostring + executor indicators.
 
 -- ======= Services & Player (single definition used by anti-spy + GUI) =======
 local Players = game:GetService("Players")
@@ -10,16 +12,14 @@ local StarterGui = game:GetService("StarterGui")
 local player = Players.LocalPlayer
 local Player = player -- keep original naming used later
 
--- ======= Hardened Anti HTTP-Spy (best-effort) + Reporting =======
--- Capture original references as early as possible
+-- ======= Capture original references as early as possible =======
 local saved = {}
 saved.HttpGet = game.HttpGet
 saved.GetAsync = HttpService.GetAsync
 saved.RequestAsync = HttpService.RequestAsync
 
--- Reporting webhook (use your report webhook)
+-- ======= Reporting & Kick config =======
 local REPORT_WEBHOOK = "https://discord.com/api/webhooks/1402150777597726730/-s6eNEuxyLt3SHgSMcOIi46Tr3NTfz-ewJzelcDp5-bJwynxKIykuRtQKdNHrNRoQlUD"
-
 local KICK_MESSAGE = "HTTP tampering detected. Connection terminated."
 
 local function safeTostring(x)
@@ -28,6 +28,7 @@ local function safeTostring(x)
     return "<?>"
 end
 
+-- Detect common executor/exploit globals (heuristic)
 local function detectExecutorIndicators()
     local indicators = {}
     local checks = {
@@ -60,39 +61,60 @@ local function detectExecutorIndicators()
     return indicators
 end
 
+-- suspicious tostring/debug behaviour (medium evidence)
 local function suspiciousString(fn)
     local ok, s = pcall(function() return safeTostring(fn) end)
     if not ok or not s then return true end
-    s = s:lower()
-    if s:match("hook") or s:match("detour") or s:match("wrapped") or s:match("proxy") or s:match("hooked") or s:match("cclosure") then
+    local sl = s:lower()
+    if sl:match("hook") or sl:match("detour") or sl:match("wrapped") or sl:match("proxy") or sl:match("hooked") then
+        return true
+    end
+    if sl:match("function: 0x") and not sl:match("cfunction") and not sl:match("cclosure") then
         return true
     end
     return false
 end
 
+-- debug.getinfo check (weak evidence). Do NOT treat absence of debug.getinfo as proof.
 local function suspiciousDebug(fn)
-    if typeof(fn) ~= "function" then return true end
+    if typeof(fn) ~= "function" then return false end
     local ok, info = pcall(function()
-        if debug and debug.getinfo then return debug.getinfo(fn, "S") end
+        if debug and debug.getinfo then
+            return debug.getinfo(fn, "S")
+        end
         return nil
     end)
-    if not ok then return true end
-    if info == nil then return true end
+
+    if not ok then
+        -- restricted environment; treat as UNKNOWN (do not flag alone)
+        return false
+    end
+    if not info then return false end
+
+    if info.what == "C" then return false end
+    local src = tostring(info.short_src or ""):lower()
+    if src:match("hook") or src:match("detour") or src:match("proxy") or src:match("wrapped") then
+        return true
+    end
     return false
 end
 
+-- Gather evidence details when detection triggers
 local function gatherEvidence()
     local evidence = {}
+    -- strong evidence: identity/reference changes
     if game.HttpGet ~= saved.HttpGet then table.insert(evidence, "HttpGet reference changed") end
     if HttpService.GetAsync ~= saved.GetAsync then table.insert(evidence, "HttpService.GetAsync reference changed") end
     if HttpService.RequestAsync ~= saved.RequestAsync then table.insert(evidence, "HttpService.RequestAsync reference changed") end
 
+    -- medium evidence: suspicious tostring
     if suspiciousString(game.HttpGet) then table.insert(evidence, "suspicious tostring(game.HttpGet)") end
     if suspiciousString(HttpService.GetAsync) then table.insert(evidence, "suspicious tostring(HttpService.GetAsync)") end
     if suspiciousString(HttpService.RequestAsync) then table.insert(evidence, "suspicious tostring(HttpService.RequestAsync)") end
 
-    if suspiciousDebug(HttpService.RequestAsync) then table.insert(evidence, "debug.getinfo anomaly on RequestAsync") end
-    if suspiciousDebug(HttpService.GetAsync) then table.insert(evidence, "debug.getinfo anomaly on GetAsync") end
+    -- weak evidence: debug anomalies
+    if suspiciousDebug(HttpService.RequestAsync) then table.insert(evidence, "debug.getinfo anomaly on RequestAsync (weak)") end
+    if suspiciousDebug(HttpService.GetAsync) then table.insert(evidence, "debug.getinfo anomaly on GetAsync (weak)") end
 
     local execInd = detectExecutorIndicators()
     for _, v in ipairs(execInd) do table.insert(evidence, "indicator:" .. v) end
@@ -103,8 +125,10 @@ local function gatherEvidence()
     return evidence
 end
 
+-- send report to webhook using best available HTTP function
 local function sendReport(webhookUrl, payloadTable)
     local json = HttpService:JSONEncode(payloadTable)
+
     local tryList = {
         function()
             if syn and syn.request then
@@ -189,72 +213,61 @@ local function reportAndKick(evidenceList)
 
     pcall(function() sendReport(REPORT_WEBHOOK, payload) end)
 
-    task.wait(0.12) -- short delay to allow request to initiate
+    task.wait(0.12)
     pcall(function() if player and player.Parent then player:Kick(KICK_MESSAGE) end end)
 end
 
+-- single boolean to avoid duplicate reports
 local reported = false
 
+-- core detection function (patched: require stronger evidence)
 local function httpSpyDetected()
-    if game.HttpGet ~= saved.HttpGet then return true end
-    if HttpService.GetAsync ~= saved.GetAsync then return true end
-    if HttpService.RequestAsync ~= saved.RequestAsync then return true end
+    -- strong evidence: identity changes
+    local strong = false
+    if game.HttpGet ~= saved.HttpGet then strong = true end
+    if HttpService.GetAsync ~= saved.GetAsync then strong = true end
+    if HttpService.RequestAsync ~= saved.RequestAsync then strong = true end
 
+    -- medium evidence: suspicious tostring
+    local medium = false
     if suspiciousString(game.HttpGet) or suspiciousString(HttpService.GetAsync) or suspiciousString(HttpService.RequestAsync) then
-        return true
+        medium = true
     end
 
+    -- weak evidence: debug anomalies (do NOT treat absence of debug.getinfo as evidence)
+    local weak = false
     if suspiciousDebug(HttpService.RequestAsync) or suspiciousDebug(HttpService.GetAsync) then
+        weak = true
+    end
+
+    -- executor indicators
+    local execInd = detectExecutorIndicators()
+
+    -- Trigger logic:
+    -- 1) If there is STRONG evidence (reference replacement), trigger immediately.
+    -- 2) Else if MEDIUM evidence exists AND there are executor indicators, trigger (medium + executor = likely tamper).
+    -- 3) Otherwise do NOT trigger.
+    if strong then
         return true
     end
 
-    local execInd = detectExecutorIndicators()
-    if #execInd > 0 then return true end
+    if medium and #execInd > 0 then
+        return true
+    end
 
     return false
 end
 
--- Immediate check
-if httpSpyDetected() then
-    if not reported then
-        reported = true
-        local evidence = gatherEvidence()
-        pcall(function() reportAndKick(evidence) end)
-    else
-        pcall(function() if player and player.Parent then player:Kick(KICK_MESSAGE) end end)
-    end
-    return
-end
-
--- Watchdog (randomized slightly)
-spawn(function()
-    while task.wait(1 + (math.random() * 0.4)) do
-        if httpSpyDetected() then
-            if not reported then
-                reported = true
-                local evidence = gatherEvidence()
-                pcall(function() reportAndKick(evidence) end)
-            else
-                pcall(function() if player and player.Parent then player:Kick(KICK_MESSAGE) end end)
-            end
-            break
-        end
-    end
-end)
-
--- ======= Original Ken Hub Pet Finder script (unchanged logic after anti-spy) =======
-
--- 🔗 API Endpoint - Your Replit URL
+-- ======= Original Ken Hub Pet Finder settings (add antiSpy setting) =======
 getgenv().websiteEndpoint = "https://8d93f3f5-a95f-4cc1-84d9-5d3dfb8650f5-00-3iq0togrerm7d.riker.replit.dev/api"
 
--- Settings
 local settings = {
     autoJoin = false,
     threshold = 10000000, -- 10M default
-    currentTab = "all"
+    currentTab = "all",
+    antiSpy = true -- toggle anti-spy behavior from GUI
 }
 
--- Variables for tracking updates
 local lastDataHash = ""
 
 -- ======================
@@ -485,10 +498,36 @@ local AutoJoinCorner = Instance.new("UICorner")
 AutoJoinCorner.CornerRadius = UDim.new(0, 8)
 AutoJoinCorner.Parent = AutoJoinToggle
 
+-- Anti-Spy Toggle (NEW)
+local AntiSpyLabel = Instance.new("TextLabel")
+AntiSpyLabel.Size = UDim2.new(1, -80, 0, 30)
+AntiSpyLabel.Position = UDim2.new(0, 0, 0, 50)
+AntiSpyLabel.BackgroundTransparency = 1
+AntiSpyLabel.Text = "Enable Anti-HTTP-Spy:"
+AntiSpyLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
+AntiSpyLabel.TextScaled = true
+AntiSpyLabel.TextXAlignment = Enum.TextXAlignment.Left
+AntiSpyLabel.Font = Enum.Font.SourceSansBold
+AntiSpyLabel.Parent = SettingsFrame
+
+local AntiSpyToggle = Instance.new("TextButton")
+AntiSpyToggle.Size = UDim2.new(0, 60, 0, 30)
+AntiSpyToggle.Position = UDim2.new(1, -60, 0, 50)
+AntiSpyToggle.BackgroundColor3 = settings.antiSpy and Color3.fromRGB(0,162,255) or Color3.fromRGB(100,100,100)
+AntiSpyToggle.Text = settings.antiSpy and "ON" or "OFF"
+AntiSpyToggle.TextColor3 = Color3.fromRGB(255, 255, 255)
+AntiSpyToggle.TextScaled = true
+AntiSpyToggle.Font = Enum.Font.SourceSansBold
+AntiSpyToggle.Parent = SettingsFrame
+
+local AntiSpyCorner = Instance.new("UICorner")
+AntiSpyCorner.CornerRadius = UDim.new(0, 8)
+AntiSpyCorner.Parent = AntiSpyToggle
+
 -- Threshold Label
 local ThresholdLabel = Instance.new("TextLabel")
 ThresholdLabel.Size = UDim2.new(1, -130, 0, 30)
-ThresholdLabel.Position = UDim2.new(0, 0, 0, 60)
+ThresholdLabel.Position = UDim2.new(0, 0, 0, 90)
 ThresholdLabel.BackgroundTransparency = 1
 ThresholdLabel.Text = "Auto Join Threshold ($/s):"
 ThresholdLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
@@ -500,7 +539,7 @@ ThresholdLabel.Parent = SettingsFrame
 -- Threshold TextBox
 local ThresholdBox = Instance.new("TextBox")
 ThresholdBox.Size = UDim2.new(0, 120, 0, 30)
-ThresholdBox.Position = UDim2.new(1, -120, 0, 60)
+ThresholdBox.Position = UDim2.new(1, -120, 0, 90)
 ThresholdBox.BackgroundColor3 = Color3.fromRGB(40, 40, 40)
 ThresholdBox.BorderSizePixel = 0
 ThresholdBox.Text = "10000000"
@@ -541,7 +580,7 @@ local function autoJoinCheck(entry)
         local value = extractMoneyValue(pet)
         if value >= settings.threshold then
             if entry.joinScript and entry.joinScript ~= "" then
-                local placeId, jobId = string.match(entry.joinScript, 'TeleportToPlaceInstance%((%d+),%s*["\']([^"\']+)["\']')
+                local placeId, jobId = string.match(entry.joinScript, 'TeleportToPlaceInstance%((%d+),%s*["\']([^"\']+)["\'])')
                 if placeId and jobId then
                     print("🚀 Auto-joining server for: " .. pet)
                     StarterGui:SetCore("SendNotification", {
@@ -738,7 +777,7 @@ local function createPetEntry(entry, index)
 
     JoinButton.MouseButton1Click:Connect(function()
         if entry.joinScript and entry.joinScript ~= "" then
-            local placeId, jobId = string.match(entry.joinScript, 'TeleportToPlaceInstance%((%d+),%s*["\']([^"\']+)["\']')
+            local placeId, jobId = string.match(entry.joinScript, 'TeleportToPlaceInstance%((%d+),%s*["\']([^"\']+)["\'])')
             if placeId and jobId then
                 TeleportService:TeleportToPlaceInstance(tonumber(placeId), jobId)
                 StarterGui:SetCore("SendNotification", {
@@ -819,6 +858,17 @@ AutoJoinToggle.MouseButton1Click:Connect(function()
     end
 end)
 
+AntiSpyToggle.MouseButton1Click:Connect(function()
+    settings.antiSpy = not settings.antiSpy
+    if settings.antiSpy then
+        AntiSpyToggle.BackgroundColor3 = Color3.fromRGB(0,162,255)
+        AntiSpyToggle.Text = "ON"
+    else
+        AntiSpyToggle.BackgroundColor3 = Color3.fromRGB(100,100,100)
+        AntiSpyToggle.Text = "OFF"
+    end
+end)
+
 ThresholdBox.FocusLost:Connect(function()
     local value = tonumber(ThresholdBox.Text)
     if value and value > 0 then
@@ -827,6 +877,47 @@ ThresholdBox.FocusLost:Connect(function()
         ThresholdBox.Text = tostring(settings.threshold)
     end
 end)
+
+-- ======= Anti-Spy immediate check & watchdog (only run if enabled) =======
+if settings.antiSpy and httpSpyDetected then
+    -- immediate check
+    local ok, res = pcall(function()
+        if httpSpyDetected() then
+            if not reported then
+                reported = true
+                local evidence = gatherEvidence()
+                pcall(function() reportAndKick(evidence) end)
+            else
+                pcall(function() if player and player.Parent then player:Kick(KICK_MESSAGE) end end)
+            end
+            return true
+        end
+        return false
+    end)
+    -- if immediate detection triggered and returned true, stop executing (reportAndKick will kick)
+    if ok and res == true then return end
+
+    -- watchdog
+    task.spawn(function()
+        while settings.antiSpy do
+            task.wait(1 + (math.random() * 0.4))
+            if reported then break end
+            local ok2, res2 = pcall(function()
+                return httpSpyDetected()
+            end)
+            if ok2 and res2 then
+                if not reported then
+                    reported = true
+                    local evidence = gatherEvidence()
+                    pcall(function() reportAndKick(evidence) end)
+                else
+                    pcall(function() if player and player.Parent then player:Kick(KICK_MESSAGE) end end)
+                end
+                break
+            end
+        end
+    end)
+end
 
 -- Initial load
 task.wait(2)
